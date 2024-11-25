@@ -1,0 +1,310 @@
+# internet - tor - front   - services
+#          |<nat | <socks5 | no-net
+#              tornet   \    /
+#                        proxy
+networks:
+  extern-net:
+    # a nat network that allows containers in this network
+    # to communicate with the internet (outbound)
+  tor-net:
+    # a internal network configured not to communicate with the outside
+    # to allow services to talk to the tor-socket only
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.20.0/24
+  pay-front-net:
+    # a internal network configured not to communicate with the outside
+    # to allow services to get proxied by caddy
+    driver: bridge
+    internal: true
+    # a internal network configured not to communicate with the outside
+    # to allow the service talk to its dependents (db,bitcoind)
+  pay-net:
+    driver: bridge
+    internal: true
+
+
+services:
+  tor:
+    # create the socks5t proxy that can be used for network communications of
+    # the services and configure the hidden service
+    # this service does not use a dockerfile to avoid that any leftover images
+    # point to the existence of the service. it relies on docker rm to clean up
+    # this service does talk to the internet using NAT
+    #   and does not expose any ports to the host/public-internet
+    # this service does expose the 9050 port for internal services to provide
+    #   them with torified internet access if they support it
+    restart: unless-stopped
+    image: alpine:edge
+    pull_policy: always
+    healthcheck:
+      test: 'curl -x socks5h://127.0.0.1:9050 "https://check.torproject.org/api/ip" | grep -qm1 -E "\"IsTor\"\s*:\s*true"'
+      interval: 300s
+      timeout: 15s
+      retries: 5
+    user: root
+    entrypoint: /bin/sh -c "/bin/sh -c \"$${@}\""
+    command: |
+      /bin/bash -c '
+        # install
+        # curl - for healthcheck
+        # tor - for proxy
+        apk add --no-cache curl tor sudo && rm -rf /var/cache/apk/*
+        # configure tor
+        # socks & hidden_service
+        sed "1s|^|SocksPort 0.0.0.0:9050\nHiddenServiceDir /var/lib/tor/hidden_service/\nHiddenServicePort 80 10.20.20.20:80\n|" /etc/tor/torrc.sample \
+          > /etc/tor/torrc
+        # ensure the mounted volumes have the correct access permissions
+        # and the tor-group is available
+        addgroup tor
+        mkdir -p /var/lib/tor/hidden_service
+        # configure hidden service from .env
+        test -z "${TOR_HIDDEN_SERVICE_PUBLIC_KEY}" \
+          || echo -n "'${TOR_HIDDEN_SERVICE_PUBLIC_KEY}'" | base64 -d \
+          > /var/lib/tor/hidden_service/hs_ed25519_public_key
+        test -z "'${TOR_HIDDEN_SERVICE_SECRET_KEY}'" \
+          || echo -n "'${TOR_HIDDEN_SERVICE_SECRET_KEY}'" | base64 -d \
+          > /var/lib/tor/hidden_service/hs_ed25519_secret_key
+        test -z "'${TOR_HIDDEN_SERVICE_HOSTNAME}'" \
+          || echo -n "'${TOR_HIDDEN_SERVICE_HOSTNAME}'" | base64 -d \
+          > /var/lib/tor/hidden_service/hostname
+        (sleep 10 && cat /var/lib/tor/hidden_service/hostname)&
+        chown -R tor:tor /var/lib/tor
+        chmod 700 /var/lib/tor/hidden_service
+        chmod 600 /var/lib/tor/hidden_service/*
+        sudo -u tor tor
+        '
+    # volumes:
+    #   - "./local_data/tor:/var/lib/tor"
+    networks:
+      tor-net:
+        aliases:
+          - tor
+        # privoxy/bitcoind need a static ip-address not a hostname
+        ipv4_address: 10.20.20.10
+      extern-net:
+
+  front:
+    # hidden service gateway. will receive the tor-hidden-service requests
+    # and is responsible routing the requests to the payment service
+    image: caddy:alpine
+    pull_policy: always
+    restart: unless-stopped
+    volumes:
+      - ./front/Caddyfile:/etc/caddy/Caddyfile
+      - ./front/site:/srv
+      - ./front/data:/data
+      - ./front/config:/config
+    environment:
+      INIT_PASSWORD: ${INIT_PASSWORD}
+    networks:
+      tor-net:
+        aliases:
+          - front
+        # tor configures the hidden service to respond on this address
+        ipv4_address: 10.20.20.20
+      pay-front-net:
+
+  service-proxy:
+    # service http-proxy
+    # unfortunately not all services are able to use a socks5 proxy for
+    # communication, therefore this service proxy exposes a http/https proxy
+    # as legacy fallback. This allows the services to do any internet request
+    # and ensure it is forwarded to the tor-network.
+    # the proxy has no direct internet access, so no leaking is possible and
+    # it has rules for internal services (nbxplorer) to keep them internal
+    # this has to be a docker-image, otherwise this proxy would need internet
+    # access for installing.
+    build: ./service-proxy
+    pull_policy: always
+    healthcheck:
+      test: 'pgrep privoxy'
+      interval: 30s
+      timeout: 15s
+      retries: 5
+    restart: unless-stopped
+    user: root
+    command: |
+      /bin/sh -c '
+        echo "forward-socks5t / 10.20.20.10:9050 ." >> /etc/privoxy/config \
+        && echo "{+forward-override{forward .}}" >> /etc/privoxy/user.action \
+        && echo "nbx" >> /etc/privoxy/user.action \
+        && sed -ibackup "s|listen-address\\s*127.0.0.1:8118|listen-address 0.0.0.0:8118|g" \
+          /etc/privoxy/config \
+        && sudo -u privoxy /usr/sbin/privoxy --no-daemon /etc/privoxy/config
+      '
+    networks:
+      tor-net:
+      pay-net:
+        aliases:
+          - proxy
+
+# Services
+# those service use a internal network only. they cannot directly communicate
+# to the internet, enforced by a network without a default gateway.
+# All communication has to be done via socks5 proxy or the service-proxy
+
+  pay-nbx-db:
+    # database for nbxplorer
+    # stores the blockchain data in a easy to query state
+    image: postgres:16
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nbx
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./local_data/pay/db-nbx:/var/lib/postgresql/data
+    networks:
+      pay-net:
+        aliases:
+          - db-nbx
+
+  pay-server-db:
+    # database for pay-server
+    # stores the configuration and wallet data
+    image: postgres:16
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: server
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./local_data/pay/db-server:/var/lib/postgresql/data
+    networks:
+      pay-net:
+        aliases:
+          - db-server
+
+  pay-nbx:
+    # multi-coin service that allows pay-server to quickly check if a
+    # transaction happened
+    # does not need internet access, only talks to pay-server and pay-bitcoind
+    restart: unless-stopped
+    image: nicolasdorier/nbxplorer:${BTCPAY_NBX_VERSION}
+    depends_on:
+      pay-nbx-db:
+        condition: service_healthy
+      pay-bitcoind:
+        condition: service_healthy
+    healthcheck:
+      test: 'grep dotnet /proc/1/cmdline'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      NBXPLORER_NETWORK: mainnet
+      NBXPLORER_BIND: 0.0.0.0:32838
+      NBXPLORER_TRIMEVENTS: 10000
+      NBXPLORER_SIGNALFILESDIR: /datadir
+      NBXPLORER_POSTGRES: Username=postgres;Password=postgres;Host=db-nbx;Port=5432;Application Name=nbxplorer;MaxPoolSize=20;Database=nbx
+      NBXPLORER_CHAINS: "btc"
+      NBXPLORER_BTCRPCURL: http://bitcoind:43782/
+      NBXPLORER_BTCNODEENDPOINT: bitcoind:39388
+    volumes:
+      - "./local_data/pay/nbx-data:/datadir"
+      - "./local_data/pay/bitcoin_datadir:/root/.bitcoin"
+    networks:
+      pay-net:
+        aliases:
+          - nbx
+
+  pay-server:
+    # bitpay server, manually configured
+    # .net application that does all kinds of internet requests.
+    # it is requested to use the service-proxy for that (which then
+    # routes the request to tor) and cannot communicate to the internet directly
+    # (enforced by network without gateway)
+    # the application-communication happens through the front-service which
+    # forwards all hidden-service-requests to this instance
+    restart: unless-stopped
+    image: btcpayserver/btcpayserver:${BTXPAY_SERVER_VERSION}
+    healthcheck:
+      test: 'grep dotnet /proc/1/cmdline'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      pay-nbx:
+        condition: service_healthy
+      pay-server-db:
+        condition: service_healthy
+    environment:
+      # BTCPay settings
+      BTCPAY_POSTGRES: Username=postgres;Password=postgres;Host=db-server;Port=5432;Application Name=btcpayserver;Database=btcpayserver
+      BTCPAY_EXPLORERPOSTGRES: Username=postgres;Password=postgres;Host=db-nbx;Port=5432;Application Name=btcpayserver;MaxPoolSize=80;Database=nbx
+      BTCPAY_NETWORK: mainnet
+      BTCPAY_BIND: 0.0.0.0:49392
+      BTCPAY_ROOTPATH: /
+      BTCPAY_DEBUGLOG: btcpay.log
+      BTCPAY_UPDATEURL: https://api.github.com/repos/btcpayserver/btcpayserver/releases/latest
+      BTCPAY_DOCKERDEPLOYMENT: "true"
+      BTCPAY_CHAINS: "btc"
+      BTCPAY_BTCEXPLORERURL: http://nbx:32838/
+      HTTP_PROXY: proxy:8118
+      HTTPS_PROXY: proxy:8118
+    volumes:
+      - "./local_data/pay/data:/datadir"
+      - "./local_data/pay/nbx-data:/root/.nbxplorer"
+      - "./local_data/pay/plugins:/root/.btcpayserver/Plugins"
+    networks:
+      pay-net:
+        aliases:
+          - server
+      pay-front-net:
+        aliases:
+          - pay-server
+
+  pay-bitcoind:
+    # bitcoin full node for payment-server
+    # syncronizes with the blockchain (using tor-network) and exposes a
+    # internal rpc for the nbxplorer
+    restart: unless-stopped
+    image: btcpayserver/bitcoin:26.0
+    healthcheck:
+      test: 'grep bitcoind /proc/*/cmdline'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      BITCOIN_NETWORK: mainnet
+      CREATE_WALLET: "false"
+      BITCOIN_WALLETDIR: "/walletdata"
+      # rpcport and rpcbind seems duplicates, but they are not
+      # rpcport is using by some tooling to automatically get
+      # the rpcport from the configuration file. Do not remove!
+      BITCOIN_EXTRA_ARGS: |
+        rpcport=43782
+        rpcbind=0.0.0.0:43782
+        rpcallowip=0.0.0.0/0
+        port=39388
+        whitelist=0.0.0.0/0
+        maxmempool=500
+        prune=5000
+        proxy=10.20.20.10:9050
+        listen=1
+        listenonion=0
+        bind=0.0.0.0
+        discover=1
+    volumes:
+      - "./local_data/pay/bitcoin_datadir:/data"
+      - "./local_data/pay/bitcoin_wallet_datadir:/walletdata"
+    networks:
+      pay-net:
+        aliases:
+          - bitcoind
+      tor-net:

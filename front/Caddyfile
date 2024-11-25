@@ -1,0 +1,21 @@
+{
+    auto_https off
+    debug
+}
+(init_auth) {
+  # keep enabled until all services are setup
+  basicauth / {
+    init {$INIT_PASSWORD}
+  }
+}
+
+:80 {
+    import init_auth
+    reverse_proxy pay-server:49392
+    header / {
+        X-XSS-Protection "1; mode=block"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Content-Security-Policy "default-src 'self';"
+    }
+}
